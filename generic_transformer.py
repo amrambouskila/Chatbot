@@ -291,6 +291,7 @@ class ChatbotDataset(Dataset):
         self.sos_token = torch.tensor([tokenizer.token_to_id('[SOS]')], dtype=torch.int64)
         self.eos_token = torch.tensor([tokenizer.token_to_id('[EOS]')], dtype=torch.int64)
         self.pad_token = torch.tensor([tokenizer.token_to_id('[PAD]')], dtype=torch.int64)
+        self.unk_token = torch.tensor([tokenizer.token_to_id('[UNK]')], dtype=torch.int64)
 
     def __len__(self):
         return len(self.dataset.dataset.keys())
@@ -329,7 +330,7 @@ class ChatbotDataset(Dataset):
             [
                 torch.tensor(response_tokens, dtype=torch.int64),
                 self.eos_token,
-                torch.tensor([self.pad_token] * num_dec_padding_token, dtype=torch.int64),
+                torch.tensor([self.pad_token] * (num_dec_padding_token + 1), dtype=torch.int64),
             ]
         )
 
@@ -592,9 +593,12 @@ def train_chatbot(raw_dataset: list, config: dict):
 
                     # Mask the special tokens in the loss calculation
                     for token in [train_dataset.sos_token, train_dataset.eos_token, train_dataset.pad_token, train_dataset.unk_token]:
-                        loss.masked_fill_(labels.view(-1) == token, 0)
+                        loss = torch.where(labels == token.to(device), torch.tensor(0.0).to(device), loss)
 
-                if torch.isnan(loss) or torch.isinf(loss):
+                    # Sum the loss to get a scalar value
+                    loss = loss.sum()
+
+                if torch.any(torch.isnan(loss)) or torch.any(torch.isinf(loss)):
                     print(f"NaN or Inf detected in loss at batch {idx + 1} - {batch['context']}, {batch['response']}")
                     continue
 
@@ -606,7 +610,7 @@ def train_chatbot(raw_dataset: list, config: dict):
                 scheduler.step()
 
                 train_batch_end_time = time.time()
-                if train_batch_end_time - train_batch_start_time > 1:
+                if train_batch_end_time - train_batch_start_time > 3:
                     print(f'batch {idx + 1} took {train_batch_end_time - train_batch_start_time} seconds')
 
 
