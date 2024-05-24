@@ -142,7 +142,7 @@ if __name__ == '__main__':
     if train_info is not None:
         n_strings = len(train_info['dataset'].keys())
         preprocessed_sentences = [train_info['dataset'][i]['context'] for i in range(n_strings)] + [train_info['dataset'][n_strings - 1]['response']]
-        word_analytics(sentences=preprocessed_sentences, config=config)
+        word_analytics(sentences=preprocessed_sentences)
         plot_losses(config=config, train_info=train_info)
 
     chat(config=config)
