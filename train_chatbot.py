@@ -6,8 +6,8 @@ import logging
 from tqdm import tqdm
 import torch.nn as nn
 from pathlib import Path
-from typing import Union
 from typeguard import typechecked
+from typing import Union, Optional
 from tokenizers.models import WordLevel
 from torch.cuda.amp import GradScaler, autocast
 from tokenizers.trainers import WordLevelTrainer
@@ -25,16 +25,25 @@ hf_logging.set_verbosity_error()
 class ChatbotDataset(Dataset):
     special_tokens = []
 
-    def __init__(self, dataset: dataset.Subset, tokenizer: Tokenizer, seq_len: int, logger: logging.Logger):
+    def __init__(self, dataset: dataset.Subset, tokenizer: Union[Tokenizer, GPT2Tokenizer], seq_len: int, logger: logging.Logger, transfer_learning: bool):
         super().__init__()
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.logger = logger
-        self.sos_token = torch.tensor([tokenizer.token_to_id('[SOS]')], dtype=torch.int64)
-        self.eos_token = torch.tensor([tokenizer.token_to_id('[EOS]')], dtype=torch.int64)
-        self.pad_token = torch.tensor([tokenizer.token_to_id('[PAD]')], dtype=torch.int64)
-        self.unk_token = torch.tensor([tokenizer.token_to_id('[UNK]')], dtype=torch.int64)
+        self.transfer_learning = transfer_learning
+
+        if not transfer_learning:
+            self.sos_token = torch.tensor([tokenizer.token_to_id('[SOS]')], dtype=torch.int64)
+            self.eos_token = torch.tensor([tokenizer.token_to_id('[EOS]')], dtype=torch.int64)
+            self.pad_token = torch.tensor([tokenizer.token_to_id('[PAD]')], dtype=torch.int64)
+            self.unk_token = torch.tensor([tokenizer.token_to_id('[UNK]')], dtype=torch.int64)
+        else:
+            self.sos_token = torch.tensor([tokenizer.convert_tokens_to_ids('<|sos|>')])
+            self.eos_token = torch.tensor([tokenizer.eos_token_id])
+            self.pad_token = torch.tensor([tokenizer.convert_tokens_to_ids('<|pad|>')])
+            self.unk_token = torch.tensor([tokenizer.convert_tokens_to_ids('<|unk|>')])
+
         self.__class__.special_tokens = list({*self.__class__.special_tokens, *[self.sos_token, self.eos_token, self.pad_token, self.unk_token]})
 
     def __len__(self):
@@ -43,8 +52,12 @@ class ChatbotDataset(Dataset):
     def __getitem__(self, index: int):
         context = self.dataset.dataset[index]['context']
         response = self.dataset.dataset[index]['response']
-        context_tokens = self.tokenizer.encode(context).ids
-        response_tokens = self.tokenizer.encode(response).ids
+        if self.transfer_learning:
+            context_tokens = self.tokenizer.encode(context)
+            response_tokens = self.tokenizer.encode(response)
+        else:
+            context_tokens = self.tokenizer.encode(context).ids
+            response_tokens = self.tokenizer.encode(response).ids
 
         num_enc_padding_token = self.seq_len - (len(context_tokens) + 2)
         num_dec_padding_token = self.seq_len - (len(response_tokens) + 2)
@@ -157,10 +170,23 @@ def preprocess_text_data(dataset: list, seq_len: int) -> dict:
 
 
 @typechecked
-def get_or_build_tokenizer(config: dict, dataset: dict, transfer_learning: bool) -> Union[GPT2Tokenizer, Tokenizer]:
-    if transfer_learning:
+def get_or_build_tokenizer(config: dict, dataset: Optional[dict] = None) -> Union[GPT2Tokenizer, Tokenizer]:
+    if config['transfer_learning']:
         tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-        tokenizer.pad_token = tokenizer.eos_token
+
+        # Define the special tokens
+        sos_token = "<|sos|>"
+        pad_token = "<|pad|>"
+        unk_token = "<|unk|>"
+
+        # Add the special tokens to the tokenizer
+        tokenizer.add_special_tokens({
+            'pad_token': pad_token,
+            'unk_token': unk_token,
+            'additional_special_tokens': [sos_token]
+        })
+
+        # Resize the model's token embeddings to accommodate the new tokens
         return tokenizer
 
     tokenizer_path = Path(config['tokenizer_path'])
@@ -183,7 +209,12 @@ def get_or_build_tokenizer(config: dict, dataset: dict, transfer_learning: bool)
 
 
 @typechecked
-def split_dataset(dataset: dict, tokenizer: Union[Tokenizer, GPT2Tokenizer], config: dict, logger: logging.Logger) -> (ChatbotDataset, ChatbotDataset):
+def split_dataset(
+        dataset: dict,
+        tokenizer: Union[Tokenizer, GPT2Tokenizer],
+        config: dict,
+        logger: logging.Logger
+) -> (ChatbotDataset, ChatbotDataset):
 
     # Split the dataset into training and validation sets
     train_dataset_size = int(0.9 * len(dataset))
@@ -191,8 +222,8 @@ def split_dataset(dataset: dict, tokenizer: Union[Tokenizer, GPT2Tokenizer], con
     train_dataset_raw, val_dataset_raw = random_split(dataset, (train_dataset_size, val_dataset_size))
 
     # Create the dataset
-    train_dataset = ChatbotDataset(dataset=train_dataset_raw, tokenizer=tokenizer, seq_len=config['seq_len'], logger=logger)
-    val_dataset = ChatbotDataset(dataset=val_dataset_raw, tokenizer=tokenizer, seq_len=config['seq_len'], logger=logger)
+    train_dataset = ChatbotDataset(dataset=train_dataset_raw, tokenizer=tokenizer, seq_len=config['seq_len'], logger=logger, transfer_learning=config['transfer_learning'])
+    val_dataset = ChatbotDataset(dataset=val_dataset_raw, tokenizer=tokenizer, seq_len=config['seq_len'], logger=logger, transfer_learning=config['transfer_learning'])
 
     return train_dataset, val_dataset
 
@@ -358,26 +389,27 @@ def autoregressive_decode(model: Transformer, input_tokens: torch.Tensor, seq_le
 
 
 @typechecked
-def train_chatbot(raw_dataset: list, config: dict, logger: logging.Logger, transfer_learning: bool = False):
+def train_chatbot(raw_dataset: list, config: dict, train_info: dict, logger: logging.Logger):
     model_path = Path(config['model_path'])
     if not model_path.exists():
-        train_info = {}
         num_epochs = config['num_epochs']
         dataset = preprocess_text_data(dataset=raw_dataset, seq_len=config['seq_len'])
         train_info['dataset'] = dataset
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         logger.info(f'The neural network will be running on {device}')
-        tokenizer = get_or_build_tokenizer(config=config, dataset=dataset, transfer_learning=transfer_learning)
+        tokenizer = get_or_build_tokenizer(config=config, dataset=dataset)
         train_dataset, val_dataset = split_dataset(dataset=dataset, tokenizer=tokenizer, config=config, logger=logger)
         train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=custom_collate_fn, pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, collate_fn=custom_collate_fn, pin_memory=True)
         vocab_size = len(tokenizer.get_vocab())
         total_batches = len(train_loader)
 
-        if transfer_learning:
+        if config['transfer_learning']:
             model = GPT2LMHeadModel.from_pretrained('gpt2')
-            model.resize_token_embeddings(len(tokenizer))
-            optimizer = AdamW(model.parameters(), lr=config['learning_rate'])
             model.to(device)
+            model.resize_token_embeddings(len(tokenizer))
+            criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.convert_tokens_to_ids('<|pad|>'))
+            optimizer = AdamW(model.parameters(), lr=config['learning_rate'])
             scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0,
                                                         num_training_steps=total_batches * num_epochs)
 
@@ -405,10 +437,8 @@ def train_chatbot(raw_dataset: list, config: dict, logger: logging.Logger, trans
                 mode='triangular2'
             )
 
+        val_loss = 0.0
         scaler = GradScaler()
-        train_info['train_losses'] = []
-        train_info['learning_rates'] = []
-        train_info['num_epochs'] = num_epochs
         epoch_iterator = tqdm(range(num_epochs), desc=f'Epoch counter')
         for epoch in epoch_iterator:
             epoch_time = time.time()
@@ -431,8 +461,30 @@ def train_chatbot(raw_dataset: list, config: dict, logger: logging.Logger, trans
                 optimizer.zero_grad()
 
                 with autocast():
-                    output = model.forward(encoder_input, decoder_input, encoder_mask, decoder_mask)
-                    loss = criterion(output.view(-1, vocab_size), labels.view(-1))
+                    if config['transfer_learning']:
+                        # Concatenate encoder and decoder inputs
+                        combined_input = torch.cat((encoder_input, decoder_input), dim=1)  # (batch_size, seq_len * 2)
+
+                        # Create attention mask for the combined input
+                        encoder_mask = (encoder_input != tokenizer.pad_token_id).long()  # (batch_size, seq_len)
+                        decoder_mask = (decoder_input != tokenizer.pad_token_id).long()  # (batch_size, seq_len)
+
+                        # Combined mask: encoder mask followed by decoder mask
+                        combined_mask = torch.cat((encoder_mask, decoder_mask), dim=1)  # (batch_size, seq_len * 2)
+
+                        # Ensure the combined_mask has the same number of dimensions as combined_input
+                        combined_mask = combined_mask.unsqueeze(1)  # (batch_size, 1, seq_len * 2)
+
+                        # Forward pass
+                        outputs = model(input_ids=combined_input, attention_mask=combined_mask)
+                        decoder_output_logits = outputs.logits
+
+                        # Since target labels correspond only to the decoder part, slice the output logits accordingly
+                        output = decoder_output_logits[:, encoder_input.size(1):, :]
+                        loss = criterion(output.reshape(-1, vocab_size), labels.view(-1))
+                    else:
+                        output = model.forward(encoder_input, decoder_input, encoder_mask, decoder_mask)
+                        loss = criterion(output.view(-1, vocab_size), labels.view(-1))
 
                 if torch.any(torch.isnan(loss)) or torch.any(torch.isinf(loss)):
                     logger.info(f"NaN or Inf detected in loss at batch {idx + 1} - {batch['context']}, {batch['response']}")
@@ -452,11 +504,7 @@ def train_chatbot(raw_dataset: list, config: dict, logger: logging.Logger, trans
             train_loss /= len(train_loader)
             train_info['train_losses'].append(train_loss)
             train_info['learning_rates'].append(optimizer.param_groups[0]["lr"])
-            train_info['val_losses'] = []
-            train_info['best_val_loss'] = float('inf')
-            train_info['patience_counter'] = 0
-            val_loss = 0.0
-            val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, collate_fn=custom_collate_fn, pin_memory=True)
+
             model.eval()
             with torch.no_grad():
                 for idx, batch in enumerate(val_loader):
@@ -469,13 +517,35 @@ def train_chatbot(raw_dataset: list, config: dict, logger: logging.Logger, trans
 
                     encoder_input = batch['encoder_input'].to(device, non_blocking=True)
                     encoder_mask = batch['encoder_mask'].to(device, non_blocking=True)
+                    decoder_input = batch['decoder_input'].to(device, non_blocking=True)
+                    labels = batch['label'].to(device, non_blocking=True)
 
-                    # Inference validation
-                    output_tokens = autoregressive_decode(model, encoder_input, config['seq_len'], tokenizer, device)
+                    if config['transfer_learning']:
+                        # Concatenate encoder and decoder inputs
+                        combined_input = torch.cat((encoder_input, decoder_input), dim=1)  # (batch_size, seq_len * 2)
 
-                    # Calculate loss
-                    output = model.forward(encoder_input, output_tokens, encoder_mask, None)
-                    loss = criterion(output.view(-1, vocab_size), batch['label'].view(-1).to(device))
+                        # Create attention mask for the combined input
+                        encoder_mask = (encoder_input != tokenizer.pad_token_id).long()  # (batch_size, seq_len)
+                        decoder_mask = (decoder_input != tokenizer.pad_token_id).long()  # (batch_size, seq_len)
+
+                        # Combined mask: encoder mask followed by decoder mask
+                        combined_mask = torch.cat((encoder_mask, decoder_mask), dim=1)  # (batch_size, seq_len * 2)
+
+                        # Ensure the combined_mask has the same number of dimensions as combined_input
+                        combined_mask = combined_mask.unsqueeze(1)  # (batch_size, 1, seq_len * 2)
+
+                        # Forward pass
+                        outputs = model(input_ids=combined_input, attention_mask=combined_mask)
+                        decoder_output_logits = outputs.logits
+
+                        # Since target labels correspond only to the decoder part, slice the output logits accordingly
+                        output = decoder_output_logits[:, encoder_input.size(1):, :]
+                        loss = criterion(output.reshape(-1, vocab_size), labels.view(-1))
+                    else:
+                        # Inference validation
+                        output_tokens = autoregressive_decode(model, encoder_input, config['seq_len'], tokenizer, device)
+                        output = model.forward(encoder_input, output_tokens, encoder_mask, None)
+                        loss = criterion(output.view(-1, vocab_size), batch['label'].view(-1).to(device))
 
                     if torch.isnan(loss) or torch.isinf(loss):
                         logger.info(f"NaN or Inf detected in loss at batch {idx + 1} - {batch['context']}, {batch['response']}")
@@ -488,6 +558,7 @@ def train_chatbot(raw_dataset: list, config: dict, logger: logging.Logger, trans
 
             val_loss /= len(val_loader)
             train_info['val_losses'].append(val_loss)
+            train_info['epochs'].append(epoch + 1)
 
             if val_loss < train_info['best_val_loss']:
                 train_info['best_val_loss'] = val_loss

@@ -34,10 +34,10 @@ def word_analytics(sentences: list, width: int = 800, height: int = 400, backgro
 
 
 @typechecked
-def plot_losses(config: dict, train_info: dict):
+def plot_losses(train_info: dict):
     train_losses = train_info['train_losses']
     learning_rates = train_info['learning_rates']
-    epochs = list(range(1, config['num_epochs'] + 1))
+    epochs = train_info['epochs']
 
     fig, ax1 = plt.subplots()
 
@@ -57,5 +57,5 @@ def plot_losses(config: dict, train_info: dict):
     ax2.tick_params(axis='y', labelcolor='tab:red')
 
     fig.tight_layout()
-    plt.title(f'Loss and Learning Rate over {config["num_epochs"]} Epochs')
+    plt.title(f'Loss and Learning Rate over {max(train_info["epochs"])} Epochs')
     plt.show()
