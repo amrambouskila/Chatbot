@@ -120,7 +120,7 @@ if __name__ == '__main__':
         'h': 8,
         'N': 6,
         'd_ff': 2048,
-        'num_epochs': 10,
+        'num_epochs': 100,
         'learning_rate': 1e-5,
         'patience': 5
     }
@@ -132,11 +132,11 @@ if __name__ == '__main__':
     logger = create_logger(__name__, __file__, f'{subcategory}_Chatbot')
 
     load_data_time = time.time()
-    # txt_links, all_sentences = get_text_data(subcategory=config["subcategory"], logger=logger)
-    all_sentences = load_dataset("Fishball02/anime-subtitle-dragon-ball")['train']['text']
+    txt_links, all_sentences = get_text_data(subcategory=config["subcategory"], logger=logger)
+    # all_sentences = load_dataset("Fishball02/anime-subtitle-dragon-ball")['train']['text']
     print(f'Loading data took {time.time() - load_data_time:.2f} seconds')
 
-    # word_analytics(sentences=all_sentences)
+    word_analytics(sentences=all_sentences)
     train_info = train_chatbot(raw_dataset=all_sentences, config=config, logger=logger)
 
     if train_info is not None:
