@@ -111,8 +111,8 @@ def chat(config: dict):
 
 if __name__ == '__main__':
     config = {
-        # 'subcategory': 'World War II',
-        'subcategory': 'DBZ',
+        'subcategory': 'World War II',
+        # 'subcategory': 'DBZ',
         'dropout': 0.1,
         'seq_len': 32,
         'batch_size': 128,
@@ -132,8 +132,8 @@ if __name__ == '__main__':
     logger = create_logger(__name__, __file__, f'{subcategory}_Chatbot')
 
     load_data_time = time.time()
-    # txt_links, all_sentences = get_text_data(subcategory=config["subcategory"], logger=logger)
-    all_sentences = load_dataset("Fishball02/anime-subtitle-dragon-ball")['train']['text']
+    txt_links, all_sentences = get_text_data(subcategory=config["subcategory"], logger=logger)
+    # all_sentences = load_dataset("Fishball02/anime-subtitle-dragon-ball")['train']['text']
     print(f'Loading data took {time.time() - load_data_time:.2f} seconds')
 
     word_analytics(sentences=all_sentences)

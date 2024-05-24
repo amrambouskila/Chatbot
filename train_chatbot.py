@@ -6,15 +6,19 @@ import logging
 from tqdm import tqdm
 import torch.nn as nn
 from pathlib import Path
+from typing import Union
 from typeguard import typechecked
 from tokenizers.models import WordLevel
 from torch.cuda.amp import GradScaler, autocast
 from tokenizers.trainers import WordLevelTrainer
 from tokenizers import Tokenizer, pre_tokenizers
 from torch.utils.data.dataloader import default_collate
+from transformers import GPT2LMHeadModel, GPT2Tokenizer, AdamW, logging as hf_logging, get_linear_schedule_with_warmup
 from generic_transformer import build_transformer, Transformer
 from torch.utils.data import Dataset, DataLoader, random_split, dataset
 from torch.optim.lr_scheduler import StepLR, CyclicLR, CosineAnnealingLR
+
+hf_logging.set_verbosity_error()
 
 
 @typechecked
@@ -153,7 +157,12 @@ def preprocess_text_data(dataset: list, seq_len: int) -> dict:
 
 
 @typechecked
-def get_or_build_tokenizer(config: dict, dataset: dict) -> Tokenizer:
+def get_or_build_tokenizer(config: dict, dataset: dict, transfer_learning: bool) -> Union[GPT2Tokenizer, Tokenizer]:
+    if transfer_learning:
+        tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+        tokenizer.pad_token = tokenizer.eos_token
+        return tokenizer
+
     tokenizer_path = Path(config['tokenizer_path'])
     if not tokenizer_path.exists():
         tokenizer = Tokenizer(WordLevel(unk_token='[UNK]'))
@@ -174,7 +183,7 @@ def get_or_build_tokenizer(config: dict, dataset: dict) -> Tokenizer:
 
 
 @typechecked
-def split_dataset(dataset: dict, tokenizer: Tokenizer, config: dict, logger: logging.Logger) -> (ChatbotDataset, ChatbotDataset):
+def split_dataset(dataset: dict, tokenizer: Union[Tokenizer, GPT2Tokenizer], config: dict, logger: logging.Logger) -> (ChatbotDataset, ChatbotDataset):
 
     # Split the dataset into training and validation sets
     train_dataset_size = int(0.9 * len(dataset))
@@ -349,7 +358,7 @@ def autoregressive_decode(model: Transformer, input_tokens: torch.Tensor, seq_le
 
 
 @typechecked
-def train_chatbot(raw_dataset: list, config: dict, logger: logging.Logger):
+def train_chatbot(raw_dataset: list, config: dict, logger: logging.Logger, transfer_learning: bool = False):
     model_path = Path(config['model_path'])
     if not model_path.exists():
         train_info = {}
@@ -358,34 +367,43 @@ def train_chatbot(raw_dataset: list, config: dict, logger: logging.Logger):
         train_info['dataset'] = dataset
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         logger.info(f'The neural network will be running on {device}')
-        tokenizer = get_or_build_tokenizer(config=config, dataset=dataset)
+        tokenizer = get_or_build_tokenizer(config=config, dataset=dataset, transfer_learning=transfer_learning)
         train_dataset, val_dataset = split_dataset(dataset=dataset, tokenizer=tokenizer, config=config, logger=logger)
         train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=custom_collate_fn, pin_memory=True)
         vocab_size = len(tokenizer.get_vocab())
         total_batches = len(train_loader)
 
-        model = build_transformer(
-            vocab_size=vocab_size,
-            seq_len=config['seq_len'],
-            d_model=config['d_model'],
-            N=config['N'],
-            h=config['h'],
-            dropout=config['dropout'],
-            d_ff=config['d_ff']
-        )
+        if transfer_learning:
+            model = GPT2LMHeadModel.from_pretrained('gpt2')
+            model.resize_token_embeddings(len(tokenizer))
+            optimizer = AdamW(model.parameters(), lr=config['learning_rate'])
+            model.to(device)
+            scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0,
+                                                        num_training_steps=total_batches * num_epochs)
 
-        model.to(device)
-        criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.token_to_id('[PAD]'))
-        optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'])
+        else:
+            model = build_transformer(
+                vocab_size=vocab_size,
+                seq_len=config['seq_len'],
+                d_model=config['d_model'],
+                N=config['N'],
+                h=config['h'],
+                dropout=config['dropout'],
+                d_ff=config['d_ff']
+            )
+            model.to(device)
+            criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.token_to_id('[PAD]'))
+            optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'])
 
-        # scheduler = CosineAnnealingLR(optimizer, T_max=total_batches * config['num_epochs'])
-        scheduler = CyclicLR(
-            optimizer,
-            base_lr=config['learning_rate'],
-            max_lr=1e-3,
-            step_size_up=int(total_batches / 2),
-            mode='triangular2'
-        )
+            # scheduler = CosineAnnealingLR(optimizer, T_max=total_batches * config['num_epochs'])
+            # scheduler = StepLR(optimizer, step_size=5, gamma=0.1)
+            scheduler = CyclicLR(
+                optimizer,
+                base_lr=config['learning_rate'],
+                max_lr=1e-3,
+                step_size_up=int(total_batches / 2),
+                mode='triangular2'
+            )
 
         scaler = GradScaler()
         train_info['train_losses'] = []
@@ -465,7 +483,7 @@ def train_chatbot(raw_dataset: list, config: dict, logger: logging.Logger):
 
                     val_loss += loss.item()
                     val_batch_end_time = time.time()
-                    if val_batch_end_time - val_batch_start_time > 1:
+                    if val_batch_end_time - val_batch_start_time > 3:
                         logger.info(f'batch {idx + 1} took {val_batch_end_time - val_batch_start_time} seconds')
 
             val_loss /= len(val_loader)
