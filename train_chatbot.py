@@ -2,6 +2,7 @@ import re
 import time
 import torch
 import pynvml
+import logging
 from tqdm import tqdm
 import torch.nn as nn
 from pathlib import Path
@@ -20,11 +21,12 @@ from torch.optim.lr_scheduler import StepLR, CyclicLR, CosineAnnealingLR
 class ChatbotDataset(Dataset):
     special_tokens = []
 
-    def __init__(self, dataset: dataset.Subset, tokenizer: Tokenizer, seq_len: int):
+    def __init__(self, dataset: dataset.Subset, tokenizer: Tokenizer, seq_len: int, logger: logging.Logger):
         super().__init__()
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.seq_len = seq_len
+        self.logger = logger
         self.sos_token = torch.tensor([tokenizer.token_to_id('[SOS]')], dtype=torch.int64)
         self.eos_token = torch.tensor([tokenizer.token_to_id('[EOS]')], dtype=torch.int64)
         self.pad_token = torch.tensor([tokenizer.token_to_id('[PAD]')], dtype=torch.int64)
@@ -44,6 +46,7 @@ class ChatbotDataset(Dataset):
         num_dec_padding_token = self.seq_len - (len(response_tokens) + 2)
 
         if num_enc_padding_token < 0 or num_dec_padding_token < 0:
+            self.logger.error(f'Sentence is too long')
             raise ValueError('Sentence is too long')
 
         encoder_input = torch.cat(
@@ -105,11 +108,37 @@ def remove_stutter(text: str) -> str:
     return corrected_text
 
 
-@typechecked
-def preprocess_text_data(dataset: list) -> dict:
-    text = [remove_stutter(' '.join(t.replace('\\N', ' ').split())).lower() for t in dataset]
-    text = [re.sub(r'[^A-Za-z\s]', '', t) for t in text]
-    text = [t for t in text if t != '' and len(t.split(' ')) > 1]
+def preprocess_text_data(dataset: list, seq_len: int) -> dict:
+    max_sentence_length = seq_len - 2
+
+    normalized_text = []
+    for t in dataset:
+        sentence = remove_stutter(' '.join(t.replace('\\N', ' ').split())).lower()
+        sentence = re.sub(r'[^A-Za-z\s]', '', sentence)
+        sentence = sentence.strip()
+        sentence = re.sub(r'\s+', ' ', sentence)
+        if len(sentence.split(' ')) > 1:
+            normalized_text.append(sentence)
+
+    def split(sentence: str):
+        # Split the sentence if it's too long
+        words = sentence.split(' ')
+        sentence_length = len(words)
+        if sentence_length <= max_sentence_length:
+            return [sentence]
+        else:
+            return [' '.join(words[:max_sentence_length])] + split(' '.join(words[max_sentence_length:]))
+
+    text = []
+    for t in normalized_text:
+        sentences = split(t)
+        text.extend(sentences)
+
+    max_length = -1
+    for t in text:
+        n_words = len(t.split(' '))
+        if n_words > max_length:
+            max_length = n_words
 
     text_dict = {}
     max_input_length = -1
@@ -145,7 +174,7 @@ def get_or_build_tokenizer(config: dict, dataset: dict) -> Tokenizer:
 
 
 @typechecked
-def split_dataset(dataset: dict, tokenizer: Tokenizer, config: dict):
+def split_dataset(dataset: dict, tokenizer: Tokenizer, config: dict, logger: logging.Logger) -> (ChatbotDataset, ChatbotDataset):
 
     # Split the dataset into training and validation sets
     train_dataset_size = int(0.9 * len(dataset))
@@ -153,8 +182,8 @@ def split_dataset(dataset: dict, tokenizer: Tokenizer, config: dict):
     train_dataset_raw, val_dataset_raw = random_split(dataset, (train_dataset_size, val_dataset_size))
 
     # Create the dataset
-    train_dataset = ChatbotDataset(train_dataset_raw, tokenizer, config['seq_len'])
-    val_dataset = ChatbotDataset(val_dataset_raw, tokenizer, config['seq_len'])
+    train_dataset = ChatbotDataset(dataset=train_dataset_raw, tokenizer=tokenizer, seq_len=config['seq_len'], logger=logger)
+    val_dataset = ChatbotDataset(dataset=val_dataset_raw, tokenizer=tokenizer, seq_len=config['seq_len'], logger=logger)
 
     return train_dataset, val_dataset
 
@@ -207,60 +236,14 @@ def custom_collate_fn(batch: list):
 
 
 @typechecked
-def find_embedding_layer_names(model: Transformer):
-    embedding_layer_names = []
-
-    def _find_embeddings(model, prefix: str = ''):
-        for name, child in model.named_children():
-            # Check if the child is an embedding layer
-            if isinstance(child, nn.Embedding):
-                # If prefix exists, append the current name to the prefix
-                # Otherwise, use the current name as is
-                full_name = f'{prefix}.{name}' if prefix else name
-                embedding_layer_names.append(full_name)
-            else:
-                # Recursively call _find_embeddings on the child module
-                # Append the current name to the prefix
-                new_prefix = f'{prefix}.{name}' if prefix else name
-                _find_embeddings(child, new_prefix)
-
-    # Start the recursive search from the top-level model
-    _find_embeddings(model)
-    return embedding_layer_names
-
-
-@typechecked
-def zero_special_token_grads(model: Transformer, special_token_indices: list, embedding_layer_names: list):
-    for name, param in model.named_parameters():
-        if any(embedding_layer_name in name for embedding_layer_name in embedding_layer_names) and param.grad is not None:
-            for idx in special_token_indices:
-                if idx < param.grad.size(0):
-                    param.grad[idx].zero_()
-
-
-@typechecked
-def print_gpu_utilization():
+def print_gpu_utilization(logger: logging.Logger, scale: str = 'MB'):
     pynvml.nvmlInit()
     handle = pynvml.nvmlDeviceGetHandleByIndex(0)
     info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-    print(f"GPU memory occupied: {info.used // 1024 ** 2:.2f} MB.")
-
-
-@typechecked
-def autoregressive_decode(model: Transformer, input_tokens: torch.Tensor, seq_len: int, tokenizer: Tokenizer, device: torch.device):
-    model.eval()
-    sos_token = torch.tensor([tokenizer.token_to_id('[SOS]')], dtype=torch.long, device=device).unsqueeze(0)
-    decoded_tokens = sos_token
-
-    for _ in range(seq_len):
-        with torch.no_grad():
-            output = model.forward(input_ids=input_tokens, decoder_input_ids=decoded_tokens)
-            next_token = output.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            decoded_tokens = torch.cat((decoded_tokens, next_token), dim=1)
-            if next_token.item() == tokenizer.token_to_id('[EOS]'):
-                break
-
-    return decoded_tokens
+    if scale == 'MB':
+        logger.info(f"GPU memory occupied: {info.used // 1024 ** 2:.2f} MB.")
+    else:
+        logger.info(f"GPU memory occupied: {info.used // 1024 ** 3:.2f} GB.")
 
 
 @typechecked
@@ -335,18 +318,49 @@ def nucleus_sampling_decode(model: Transformer, input_tokens: torch.Tensor, seq_
 
 
 @typechecked
-def train_chatbot(raw_dataset: list, config: dict):
+def autoregressive_decode(model: Transformer, input_tokens: torch.Tensor, seq_len: int, tokenizer: Tokenizer, device: torch.device):
+    sos_token = torch.tensor([tokenizer.token_to_id('[SOS]')], dtype=torch.long, device=device).unsqueeze(0)
+    batch_size = input_tokens.size(0)
+    decoded_tokens = sos_token.repeat(batch_size, 1)
+
+    for _ in range(seq_len - 1):  # -1 because we already have the sos_token
+        with torch.no_grad():
+            output = model.forward(src=input_tokens, tgt=decoded_tokens)
+            next_token = output[:, -1, :].argmax(dim=-1, keepdim=True)
+            decoded_tokens = torch.cat((decoded_tokens, next_token), dim=1)
+
+            # Stop decoding if the end-of-sequence token is produced
+            if (next_token == tokenizer.token_to_id('[EOS]')).all().item():
+                break
+
+    # Pad the sequence if it's shorter than seq_len
+    if decoded_tokens.size(1) < seq_len:
+        padding = torch.full((batch_size, seq_len - decoded_tokens.size(1)), tokenizer.token_to_id('[PAD]'), device=device, dtype=torch.long)
+        decoded_tokens = torch.cat((decoded_tokens, padding), dim=1)
+
+    # Truncate the sequence if it's longer than seq_len
+    decoded_tokens = decoded_tokens[:, :seq_len]
+
+    # Adjust the size of decoded_tokens to match the input batch size
+    if decoded_tokens.size(0) != batch_size:
+        decoded_tokens = decoded_tokens[:batch_size]
+
+    return decoded_tokens
+
+
+@typechecked
+def train_chatbot(raw_dataset: list, config: dict, logger: logging.Logger):
     model_path = Path(config['model_path'])
     if not model_path.exists():
         train_info = {}
-        dataset = preprocess_text_data(raw_dataset)
+        num_epochs = config['num_epochs']
+        dataset = preprocess_text_data(dataset=raw_dataset, seq_len=config['seq_len'])
         train_info['dataset'] = dataset
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f'The neural network will be running on {device}')
+        logger.info(f'The neural network will be running on {device}')
         tokenizer = get_or_build_tokenizer(config=config, dataset=dataset)
-        train_dataset, val_dataset = split_dataset(dataset=dataset, tokenizer=tokenizer, config=config)
+        train_dataset, val_dataset = split_dataset(dataset=dataset, tokenizer=tokenizer, config=config, logger=logger)
         train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=custom_collate_fn, pin_memory=True)
-        val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, collate_fn=custom_collate_fn, pin_memory=True)
         vocab_size = len(tokenizer.get_vocab())
         total_batches = len(train_loader)
 
@@ -360,9 +374,8 @@ def train_chatbot(raw_dataset: list, config: dict):
             d_ff=config['d_ff']
         )
 
-        # embedding_layer_names = find_embedding_layer_names(model)
         model.to(device)
-        criterion = nn.CrossEntropyLoss(ignore_index=train_dataset.pad_token)
+        criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.token_to_id('[PAD]'))
         optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'])
 
         # scheduler = CosineAnnealingLR(optimizer, T_max=total_batches * config['num_epochs'])
@@ -375,12 +388,10 @@ def train_chatbot(raw_dataset: list, config: dict):
         )
 
         scaler = GradScaler()
-        best_val_loss = float('inf')
-        patience = 5
-        patience_counter = 0
         train_info['train_losses'] = []
-        train_info['val_losses'] = []
-        epoch_iterator = tqdm(range(config['num_epochs']), desc=f'Epoch counter')
+        train_info['learning_rates'] = []
+        train_info['num_epochs'] = num_epochs
+        epoch_iterator = tqdm(range(num_epochs), desc=f'Epoch counter')
         for epoch in epoch_iterator:
             epoch_time = time.time()
             model.train()
@@ -392,37 +403,25 @@ def train_chatbot(raw_dataset: list, config: dict):
 
                 if int(progress) // 10 > last_printed_progress:
                     last_printed_progress = int(progress) // 10
-                    print(f'Epoch {epoch + 1}/{config["num_epochs"]} Training Loop is {progress:.2f}% completed')
+                    logger.info(f'Epoch {epoch + 1}/{config["num_epochs"]} Training Loop is {progress:.2f}% completed')
 
                 encoder_input = batch['encoder_input'].to(device, non_blocking=True)
                 decoder_input = batch['decoder_input'].to(device, non_blocking=True)
                 encoder_mask = batch['encoder_mask'].to(device, non_blocking=True)
                 decoder_mask = batch['decoder_mask'].to(device, non_blocking=True)
                 labels = batch['label'].to(device, non_blocking=True)
-
-                # print(f"Encoder input stats - Min: {encoder_input.float().min()}, Max: {encoder_input.float().max()}, Mean: {encoder_input.float().mean()}")
-                # print(f"Decoder input stats - Min: {decoder_input.float().min()}, Max: {decoder_input.float().max()}, Mean: {decoder_input.float().mean()}")
-
                 optimizer.zero_grad()
 
                 with autocast():
                     output = model.forward(encoder_input, decoder_input, encoder_mask, decoder_mask)
                     loss = criterion(output.view(-1, vocab_size), labels.view(-1))
 
-                    # Mask the special tokens in the loss calculation
-                    # mask = torch.ones_like(labels, dtype=torch.bool)
-                    # for token in [train_dataset.sos_token, train_dataset.eos_token, train_dataset.pad_token, train_dataset.unk_token]:
-                    #     mask &= (labels != token.to(device))
-
-                    # loss = (criterion(output.view(-1, vocab_size), labels.view(-1)) * mask.view(-1).float()).sum()
-
                 if torch.any(torch.isnan(loss)) or torch.any(torch.isinf(loss)):
-                    print(f"NaN or Inf detected in loss at batch {idx + 1} - {batch['context']}, {batch['response']}")
+                    logger.info(f"NaN or Inf detected in loss at batch {idx + 1} - {batch['context']}, {batch['response']}")
                     continue
 
                 scaler.scale(loss).backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-                # zero_special_token_grads(model=model, special_token_indices=ChatbotDataset.special_tokens, embedding_layer_names=embedding_layer_names)
                 scaler.step(optimizer)
                 scaler.update()
                 train_loss += loss.item()
@@ -430,63 +429,62 @@ def train_chatbot(raw_dataset: list, config: dict):
 
                 train_batch_end_time = time.time()
                 if train_batch_end_time - train_batch_start_time > 3:
-                    print(f'batch {idx + 1} took {train_batch_end_time - train_batch_start_time} seconds')
+                    logger.info(f'batch {idx + 1} took {train_batch_end_time - train_batch_start_time} seconds')
 
             train_loss /= len(train_loader)
             train_info['train_losses'].append(train_loss)
-            print(f'Epoch {epoch + 1}/{config["num_epochs"]}, Loss: {train_loss}, Learning rate: {optimizer.param_groups[0]["lr"]}')
-            print_gpu_utilization()
+            train_info['learning_rates'].append(optimizer.param_groups[0]["lr"])
+            train_info['val_losses'] = []
+            train_info['best_val_loss'] = float('inf')
+            train_info['patience_counter'] = 0
+            val_loss = 0.0
+            val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, collate_fn=custom_collate_fn, pin_memory=True)
+            model.eval()
+            with torch.no_grad():
+                for idx, batch in enumerate(val_loader):
+                    val_batch_start_time = time.time()
+                    progress = (idx + 1) / total_batches * 100
 
-            # epoch_iterator.set_postfix({f'train_loss': f'{train_loss:6.3f}'})
+                    if int(progress) // 10 > last_printed_progress:
+                        last_printed_progress = int(progress) // 10
+                        logger.info(f'Epoch {epoch + 1}/{config["num_epochs"]} Training Loop is {progress:.2f}% completed')
 
-            # model.eval()
-            # val_loss = 0.0
-            # with torch.no_grad():
-            #     for idx, batch in enumerate(val_loader):
-            #         val_batch_start_time = time.time()
-            #         progress = (idx + 1) / total_batches * 100
-            #
-            #         if int(progress) // 10 > last_printed_progress:
-            #             last_printed_progress = int(progress) // 10
-            #             print(f'Epoch {epoch + 1}/{config["num_epochs"]} Training Loop is {progress:.2f}% completed')
-            #
-            #         encoder_input = batch['encoder_input'].to(device, non_blocking=True)
-            #         encoder_mask = batch['encoder_mask'].to(device, non_blocking=True)
-            #
-            #         # Autoregressive decoding
-            #         output_tokens = autoregressive_decode(model, encoder_input, config['seq_len'], tokenizer, device)
-            #
-            #         # Calculate loss
-            #         output = model.forward(encoder_input, output_tokens[:, :-1], encoder_mask, None)
-            #         loss = criterion(output.view(-1, vocab_size), batch['label'].view(-1).to(device))
-            #
-            #         if torch.isnan(loss) or torch.isinf(loss):
-            #             print(f"NaN or Inf detected in loss at batch {idx + 1} - {batch['context']}, {batch['response']}")
-            #             continue
-            #
-            #         val_loss += loss.item()
-            #         val_batch_end_time = time.time()
-            #         if val_batch_end_time - val_batch_start_time > 1:
-            #             print(f'batch {idx + 1} took {val_batch_end_time - val_batch_start_time} seconds')
-            #
-            # val_loss /= len(val_loader)
-            # val_losses.append(val_loss)
-            # print(f'Epoch {epoch + 1}/{config["num_epochs"]}, Validation Loss: {val_loss}')
+                    encoder_input = batch['encoder_input'].to(device, non_blocking=True)
+                    encoder_mask = batch['encoder_mask'].to(device, non_blocking=True)
 
-            # if val_loss < best_val_loss:
-            #     best_val_loss = val_loss
-            #     patience_counter = 0
-            # else:
-            #     patience_counter += 1
-            #
-            # if patience_counter >= patience:
-            #     print("Early stopping triggered.")
-            #     break
+                    # Inference validation
+                    output_tokens = autoregressive_decode(model, encoder_input, config['seq_len'], tokenizer, device)
 
-            print(f'Epoch {epoch + 1} took {time.time() - epoch_time:.2f} seconds')
+                    # Calculate loss
+                    output = model.forward(encoder_input, output_tokens, encoder_mask, None)
+                    loss = criterion(output.view(-1, vocab_size), batch['label'].view(-1).to(device))
+
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        logger.info(f"NaN or Inf detected in loss at batch {idx + 1} - {batch['context']}, {batch['response']}")
+                        continue
+
+                    val_loss += loss.item()
+                    val_batch_end_time = time.time()
+                    if val_batch_end_time - val_batch_start_time > 1:
+                        logger.info(f'batch {idx + 1} took {val_batch_end_time - val_batch_start_time} seconds')
+
+            val_loss /= len(val_loader)
+            train_info['val_losses'].append(val_loss)
+
+            if val_loss < train_info['best_val_loss']:
+                train_info['best_val_loss'] = val_loss
+                train_info['patience_counter'] = 0
+            else:
+                train_info['patience_counter'] += 1
+
+            monitoring_string = f'Epoch {epoch + 1}/{config["num_epochs"]} took {time.time() - epoch_time:.2f} seconds, Loss: {train_loss},  Validation Loss: {val_loss}, Learning rate: {optimizer.param_groups[0]["lr"]}'
+            logger.info(monitoring_string)
+            epoch_iterator.set_postfix({f'Epoch {epoch + 1}/{config["num_epochs"]}': monitoring_string})
+            print_gpu_utilization(logger=logger)
+
+            if train_info['patience_counter'] >= config['patience']:
+                logger.info("Early stopping triggered.")
+                break
 
         torch.save(model.state_dict(), config['model_path'])
         return train_info
-
-
-

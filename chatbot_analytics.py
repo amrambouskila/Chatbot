@@ -11,16 +11,14 @@ sns.set()
 
 
 @typechecked
-def run_analytics(train_info: dict, config: dict):
+def word_analytics(sentences: list, width: int = 800, height: int = 400, background_color: str = 'white'):
     stop_words = set(stopwords.words('english'))
-    n_strings = len(train_info['dataset'].keys())
-    dataset = [train_info['dataset'][i]['context'] for i in range(n_strings)] + [train_info['dataset'][n_strings - 1]['response']]
-    text = [word for sentence in dataset for word in sentence if word not in stop_words]
+    text = [word for sentence in sentences for word in sentence.split(' ') if word not in stop_words]
 
     # Wordcloud
     tokens = nltk.word_tokenize(' '.join(text))
     processed_text = ' '.join(tokens)
-    wordcloud = WordCloud(width=800, height=400, background_color='white').generate(processed_text)
+    wordcloud = WordCloud(width=width, height=height, background_color=background_color).generate(processed_text)
     plt.figure(figsize=(10, 5))
     plt.imshow(wordcloud, interpolation='bilinear')
     plt.axis('off')
@@ -34,11 +32,30 @@ def run_analytics(train_info: dict, config: dict):
     ax.set_ylabel('Frequency')
     plt.show()
 
-    # Loss vs Training Time
+
+@typechecked
+def plot_losses(config: dict, train_info: dict):
     train_losses = train_info['train_losses']
-    fig, ax = plt.subplots()
-    ax.plot(list(range(1, config['num_epochs'] + 1)), train_losses, label='Training Loss')
-    ax.set_xlabel('Epochs')
-    ax.set_ylabel('Loss')
-    plt.legend()
+    learning_rates = train_info['learning_rates']
+    epochs = list(range(1, config['num_epochs'] + 1))
+
+    fig, ax1 = plt.subplots()
+
+    ax1.set_xlabel('Epochs')
+    ax1.set_ylabel('Loss', color='tab:blue')
+    ax1.plot(epochs, train_losses, label='Training Loss', color='tab:blue')
+
+    if len(train_info['val_losses']) > 0:
+        ax1.plot(epochs, train_info['val_losses'], label='Validation Loss', color='tab:orange')
+        ax1.legend(loc='best')
+
+    ax2 = ax1.twinx()
+    ax2.set_ylabel('Learning Rate', color='tab:red')
+    ax2.plot(epochs, learning_rates, label='Learning Rate', color='tab:red')
+
+    ax1.tick_params(axis='y', labelcolor='tab:blue')
+    ax2.tick_params(axis='y', labelcolor='tab:red')
+
+    fig.tight_layout()
+    plt.title(f'Loss and Learning Rate over {config["num_epochs"]} Epochs')
     plt.show()

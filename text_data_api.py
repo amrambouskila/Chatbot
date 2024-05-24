@@ -1,4 +1,5 @@
 import nltk
+import logging
 import requests
 from bs4 import BeautifulSoup
 from typeguard import typechecked
@@ -7,7 +8,7 @@ nltk.download('punkt')
 
 
 @typechecked
-def get_subcategory_link(url: str, subcategory: str):
+def get_subcategory_link(url: str, subcategory: str, logger: logging.Logger):
     # Send a GET request to the genre page
     response = requests.get(url)
 
@@ -27,7 +28,7 @@ def get_subcategory_link(url: str, subcategory: str):
                 href = link['href']
                 text = link.get_text(strip=True)
                 if href and text:
-                    print(f"Available Options: {text}, Href: https://www.gutenberg.org{href}")
+                    logger.info(f"Available Options: {text}, Href: https://www.gutenberg.org{href}")
 
             raise ValueError(f"No subcategory link found for query: {subcategory}")
     else:
@@ -35,7 +36,7 @@ def get_subcategory_link(url: str, subcategory: str):
 
 
 @typechecked
-def get_book_links(subcategory_url: str):
+def get_book_links(subcategory_url: str, logger: logging.Logger):
     start_index = 1
     txt_file_links = {}
 
@@ -48,7 +49,7 @@ def get_book_links(subcategory_url: str):
         response = requests.get(paginated_url)
 
         if response.status_code == 200:
-            print(f'Accessed {paginated_url}')
+            logger.info(f'Accessed {paginated_url}')
             soup = BeautifulSoup(response.content, 'html.parser')
             book_links = soup.find_all('li', class_='booklink')
 
@@ -73,11 +74,11 @@ def get_book_links(subcategory_url: str):
                             txt_file_link = txt_link_tag['href']
                             txt_file_links[f'{title}_{author}'] = txt_file_link
                         else:
-                            print(f'No .txt link found for book {i + 1}')
+                            logger.info(f'No .txt link found for book {i + 1}')
                     else:
-                        print(f"Failed to retrieve the book page for book {i + 1}. Status code: {book_response.status_code}")
+                        logger.info(f"Failed to retrieve the book page for book {i + 1}. Status code: {book_response.status_code}")
                 else:
-                    print(f'Title or author not found for book {i + 1}')
+                    logger.info(f'Title or author not found for book {i + 1}')
 
             if len(book_links) < 25:
                 break
@@ -90,7 +91,7 @@ def get_book_links(subcategory_url: str):
 
 
 @typechecked
-def get_sentences(txt_links: dict, intro_pct: float = 0.02):
+def get_sentences(txt_links: dict, logger: logging.Logger, intro_pct: float = 0.02):
     all_sentences = []
 
     for link in txt_links.values():
@@ -123,24 +124,24 @@ def get_sentences(txt_links: dict, intro_pct: float = 0.02):
 
 
 @typechecked
-def get_text_data(subcategory: str):
+def get_text_data(subcategory: str, logger: logging.Logger):
     url = 'https://www.gutenberg.org/ebooks/bookshelf/'
 
     # Get the link to the subcategory page
-    subcategory_url = get_subcategory_link(url, subcategory)
+    subcategory_url = get_subcategory_link(url=url, subcategory=subcategory, logger=logger)
 
     if subcategory_url:
         # Get the list of book .txt file links from the subcategory page
-        txt_links = get_book_links(subcategory_url)
+        txt_links = get_book_links(subcategory_url=subcategory_url, logger=logger)
 
         # Get all sentences from the list of .txt file links
-        all_sentences = get_sentences(txt_links)
+        all_sentences = get_sentences(txt_links=txt_links, logger=logger)
 
         # Print the number of sentences and the first few sentences as a sample
-        print(f"Total number of sentences: {len(all_sentences)}")
+        logger.info(f"Total number of sentences: {len(all_sentences)}")
         return txt_links, all_sentences
     else:
-        print("Failed to find subcategory link.")
+        logger.warning("Failed to find subcategory link.")
 
 
 if __name__ == '__main__':

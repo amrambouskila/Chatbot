@@ -3,8 +3,8 @@ import torch
 import matplotlib
 import seaborn as sns
 import torch.nn as nn
-from typing import Callable
 from typeguard import typechecked
+from typing import Callable, Optional
 
 matplotlib.use('Qt5Agg', force=True)
 sns.set()
@@ -108,7 +108,7 @@ class MultiHeadAttentionBlock(nn.Module):
     def attention_scores(self, attention_scores: torch.Tensor):
         self._attention_scores = attention_scores
 
-    def attention(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, mask: torch.Tensor):
+    def attention(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, mask: Optional[torch.Tensor]):
         d_k = query.shape[-1]
         attention_scores = ((query @ key.transpose(-2, -1)) / (math.sqrt(d_k)))
 
@@ -125,7 +125,7 @@ class MultiHeadAttentionBlock(nn.Module):
 
         return attention_scores @ value, attention_scores
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor):
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor]):
         query = self.w_q(q)
         key = self.w_k(k)
         value = self.w_v(v)
@@ -156,7 +156,7 @@ class EncoderBlock(nn.Module):
         self.feed_forward_block = feed_forward_block
         self.residual_connections = nn.ModuleList([ResidualConnection(dropout) for _ in range(2)])
 
-    def forward(self, x: torch.Tensor, src_mask: torch.Tensor):
+    def forward(self, x: torch.Tensor, src_mask: Optional[torch.Tensor]):
         x = self.residual_connections[0](x, lambda x_i: self.self_attention_block(x_i, x_i, x_i, src_mask))
         x = self.residual_connections[1](x, self.feed_forward_block)
         return x
@@ -169,7 +169,7 @@ class Encoder(nn.Module):
         self.layers = layers
         self.norm = LayerNormalization()
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor):
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
         for layer in self.layers:
             x = layer(x, mask)
 
@@ -185,7 +185,7 @@ class DecoderBlock(nn.Module):
         self.feed_forward_block = feed_forward_block
         self.residual_connections = nn.ModuleList([ResidualConnection(dropout) for _ in range(3)])
 
-    def forward(self, x: torch.Tensor, encoder_output: torch.Tensor, src_mask: torch.Tensor, tgt_mask: torch.Tensor):
+    def forward(self, x: torch.Tensor, encoder_output: torch.Tensor, src_mask: Optional[torch.Tensor], tgt_mask: Optional[torch.Tensor]):
         x = self.residual_connections[0](x, lambda x_i: self.self_attention_block(x_i, x_i, x_i, tgt_mask))
         x = self.residual_connections[1](x, lambda x_j: self.cross_attention_block(x_j, encoder_output, encoder_output, src_mask))
         x = self.residual_connections[2](x, self.feed_forward_block)
@@ -199,7 +199,7 @@ class Decoder(nn.Module):
         self.layers = layers
         self.norm = LayerNormalization()
 
-    def forward(self, x: torch.Tensor, encoder_output: torch.Tensor, src_mask: torch.Tensor, tgt_mask: torch.Tensor):
+    def forward(self, x: torch.Tensor, encoder_output: torch.Tensor, src_mask: Optional[torch.Tensor], tgt_mask: Optional[torch.Tensor]):
         for layer in self.layers:
             x = layer(x, encoder_output, src_mask, tgt_mask)
 
@@ -239,17 +239,17 @@ class Transformer(nn.Module):
         self.tgt_pos = tgt_pos
         self.projection_layer = projection_layer
 
-    def encode(self, src: torch.Tensor, src_mask: torch.Tensor):
+    def encode(self, src: torch.Tensor, src_mask: Optional[torch.Tensor]):
         src = self.src_embed(src)
         src = self.src_pos(src)
         return self.encoder(src, src_mask)
 
-    def decode(self, encoder_output: torch.Tensor, src_mask: torch.Tensor, tgt: torch.Tensor, tgt_mask: torch.Tensor):
+    def decode(self, encoder_output: torch.Tensor, src_mask: Optional[torch.Tensor], tgt: torch.Tensor, tgt_mask: Optional[torch.Tensor]):
         tgt = self.tgt_embed(tgt)
         tgt = self.tgt_pos(tgt)
         return self.decoder(tgt, encoder_output, src_mask, tgt_mask)
 
-    def forward(self, src: torch.Tensor, tgt: torch.Tensor, src_mask: torch.Tensor = None, tgt_mask: torch.Tensor = None):
+    def forward(self, src: torch.Tensor, tgt: torch.Tensor, src_mask: Optional[torch.Tensor] = None, tgt_mask: Optional[torch.Tensor] = None):
         # Encode the source sequence
         encoder_output = self.encode(src, src_mask)
 

@@ -1,12 +1,18 @@
+import time
 import torch
+import matplotlib
+import seaborn as sns
 from logger import create_logger
 from tokenizers import Tokenizer
 from typeguard import typechecked
 from datasets import load_dataset
 from train_chatbot import train_chatbot
 from text_data_api import get_text_data
-from chatbot_analytics import run_analytics
+from chatbot_analytics import word_analytics, plot_losses
 from generic_transformer import build_transformer, Transformer
+
+matplotlib.use('Qt5Agg', force=True)
+sns.set()
 
 
 @typechecked
@@ -105,7 +111,8 @@ def chat(config: dict):
 
 if __name__ == '__main__':
     config = {
-        'subcategory': 'World War II',
+        # 'subcategory': 'World War II',
+        'subcategory': 'DBZ',
         'dropout': 0.1,
         'seq_len': 32,
         'batch_size': 128,
@@ -114,19 +121,28 @@ if __name__ == '__main__':
         'N': 6,
         'd_ff': 2048,
         'num_epochs': 10,
-        'learning_rate': 1e-5
+        'learning_rate': 1e-5,
+        'patience': 5
     }
 
     subcategory = config["subcategory"]
-    config['model_path'] = f'./{subcategory}_LLM.pt'
+    subcategory = subcategory.replace(' ', '_')
+    config['model_path'] = f'./{subcategory}_LLM_{config["num_epochs"]}.pt'
     config['tokenizer_path'] = f'./{subcategory}_tokenizer.json'
     logger = create_logger(__name__, __file__, f'{subcategory}_Chatbot')
 
-    # txt_links, all_sentences = get_text_data(subcategory=subcategory)
+    load_data_time = time.time()
+    # txt_links, all_sentences = get_text_data(subcategory=config["subcategory"], logger=logger)
     all_sentences = load_dataset("Fishball02/anime-subtitle-dragon-ball")['train']['text']
-    train_info = train_chatbot(raw_dataset=all_sentences, config=config)
+    print(f'Loading data took {time.time() - load_data_time:.2f} seconds')
+
+    # word_analytics(sentences=all_sentences)
+    train_info = train_chatbot(raw_dataset=all_sentences, config=config, logger=logger)
 
     if train_info is not None:
-        run_analytics(train_info=train_info, config=config)
+        n_strings = len(train_info['dataset'].keys())
+        preprocessed_sentences = [train_info['dataset'][i]['context'] for i in range(n_strings)] + [train_info['dataset'][n_strings - 1]['response']]
+        word_analytics(sentences=preprocessed_sentences, config=config)
+        plot_losses(config=config, train_info=train_info)
 
     chat(config=config)

@@ -13,8 +13,8 @@ def create_logger(name: str, file: str, log_name: str):
     if not Path(file).parent.parent.joinpath('Logs').exists():
         Path(file).parent.parent.joinpath('Logs').mkdir(parents=True, exist_ok=True)
 
-    error_logging_file = Path(file).parent.parent.joinpath(f'Logs\{log_name}_Errors.log')
-    info_logging_file = Path(file).parent.parent.joinpath(f'Logs\{log_name}_Info.log')
+    error_logging_file = Path(file).parent.joinpath(f'Logs\{log_name}_Errors.log')
+    info_logging_file = Path(file).parent.joinpath(f'Logs\{log_name}_Info.log')
     error_file_handler = logging.FileHandler(error_logging_file)
     info_file_handler = logging.FileHandler(info_logging_file)
     error_file_handler.setLevel(logging.ERROR)
