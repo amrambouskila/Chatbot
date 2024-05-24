@@ -1,17 +1,17 @@
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
+from typeguard import typechecked
+from datasets import load_dataset
+from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import Dataset, DataLoader, random_split
-from torch.cuda.amp import GradScaler, autocast
-from transformers import GPT2LMHeadModel, GPT2Tokenizer, logging
-import numpy as np
-import random
-from datasets import load_dataset
+from transformers import GPT2LMHeadModel, GPT2Tokenizer, AdamW, logging, get_linear_schedule_with_warmup
 
 logging.set_verbosity_info()
 
 
+@typechecked
 class ChatbotDataset(Dataset):
     def __init__(self, dataset, tokenizer: GPT2Tokenizer, seq_len):
         self.dataset = dataset
@@ -41,11 +41,13 @@ class ChatbotDataset(Dataset):
         }
 
 
+@typechecked
 def preprocess_text_data(raw_dataset: list):
     dataset = [{'context': raw_dataset[i], 'response': raw_dataset[i + 1]} for i in range(len(raw_dataset) - 1)]
     return dataset
 
 
+@typechecked
 def split_dataset(dataset: list, tokenizer: GPT2Tokenizer, seq_len: int):
     dataset = ChatbotDataset(dataset, tokenizer, seq_len)
     train_size = int(0.9 * len(dataset))
@@ -54,6 +56,7 @@ def split_dataset(dataset: list, tokenizer: GPT2Tokenizer, seq_len: int):
     return train_dataset, val_dataset
 
 
+@typechecked
 def custom_collate_fn(batch):
     encoder_inputs = torch.stack([item['encoder_input'] for item in batch])
     decoder_inputs = torch.stack([item['decoder_input'] for item in batch])
@@ -65,6 +68,7 @@ def custom_collate_fn(batch):
     }
 
 
+@typechecked
 def train_epoch(model, train_loader, optimizer, scheduler, scaler, device):
     model.train()
     total_loss = 0
@@ -85,6 +89,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, scaler, device):
     return total_loss / len(train_loader)
 
 
+@typechecked
 def validate_epoch(model, val_loader, device):
     model.eval()
     total_loss = 0
@@ -100,6 +105,7 @@ def validate_epoch(model, val_loader, device):
     return total_loss / len(val_loader)
 
 
+@typechecked
 def train_chatbot(raw_dataset: list, config: dict):
     dataset = preprocess_text_data(raw_dataset)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -141,6 +147,7 @@ def train_chatbot(raw_dataset: list, config: dict):
             break
 
 
+@typechecked
 def autoregressive_decode(model, input_tokens, seq_len, tokenizer, device):
     model.eval()
     sos_token = torch.tensor([tokenizer.bos_token_id], dtype=torch.long, device=device).unsqueeze(0)
@@ -157,6 +164,7 @@ def autoregressive_decode(model, input_tokens, seq_len, tokenizer, device):
     return decoded_tokens
 
 
+@typechecked
 def beam_search_decode(model, input_tokens, seq_len, tokenizer, device, num_beams=3):
     model.eval()
     generated = model.generate(
@@ -168,6 +176,7 @@ def beam_search_decode(model, input_tokens, seq_len, tokenizer, device, num_beam
     return generated
 
 
+@typechecked
 def nucleus_sampling_decode(model, input_tokens, seq_len, tokenizer, device, top_p=0.9):
     model.eval()
     generated = model.generate(
@@ -180,6 +189,7 @@ def nucleus_sampling_decode(model, input_tokens, seq_len, tokenizer, device, top
     return generated
 
 
+@typechecked
 def chatbot_predict(model, sentence, tokenizer: GPT2Tokenizer, seq_len: int, device: torch.device,
                     method='beam_search'):
     input_tokens = tokenizer.encode(sentence, return_tensors='pt', truncation=True, max_length=seq_len).to(device)
@@ -194,6 +204,7 @@ def chatbot_predict(model, sentence, tokenizer: GPT2Tokenizer, seq_len: int, dev
     return output_sentence
 
 
+@typechecked
 def chat(config):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
@@ -214,19 +225,16 @@ def chat(config):
         print(f'Chatbot: {output}')
 
 
-def main():
+if __name__ == '__main__':
     raw_dataset = load_dataset("Fishball02/anime-subtitle-dragon-ball")['train']['text']
     config = {
-        'model_path': './chatbot_model.pt',
+        'model_path': './gpt_model.pt',
         'seq_len': 32,
         'batch_size': 8,
         'd_model': 512,
         'num_epochs': 10,
         'learning_rate': 5e-5
     }
+
     train_chatbot(raw_dataset=raw_dataset, config=config)
     chat(config=config)
-
-
-if __name__ == '__main__':
-    main()

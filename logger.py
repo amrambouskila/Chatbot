@@ -1,8 +1,10 @@
 import logging
 from pathlib import Path
+from typeguard import typechecked
 
 
-def create_logger(name, file, log_name):
+@typechecked
+def create_logger(name: str, file: str, log_name: str):
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
     formatter = logging.Formatter('%(asctime)s:%(levelname)s:%(name)s:%(message)s')
