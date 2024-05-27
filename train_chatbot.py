@@ -2,11 +2,14 @@ import re
 import time
 import torch
 import pynvml
+import string
 import logging
 from tqdm import tqdm
 import torch.nn as nn
 from pathlib import Path
+from collections import Counter
 from typeguard import typechecked
+from nltk.corpus import stopwords
 from typing import Union, Optional
 from tokenizers.models import WordLevel
 from torch.cuda.amp import GradScaler, autocast
@@ -26,13 +29,17 @@ class ChatbotDataset(Dataset):
     special_tokens = []
 
     def __init__(self, dataset: dataset.Subset, tokenizer: Union[Tokenizer, GPT2Tokenizer], seq_len: int, logger: logging.Logger, transfer_learning: bool):
+        # Call the constructor for the parent torch Dataset class
         super().__init__()
+
+        # Store variables that will be called in the __getitem__ method
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.logger = logger
         self.transfer_learning = transfer_learning
 
+        # Depending on the tokenizer, different sos, eos, pad, and unk tokens are assigned
         if not transfer_learning:
             self.sos_token = torch.tensor([tokenizer.token_to_id('[SOS]')], dtype=torch.int64)
             self.eos_token = torch.tensor([tokenizer.token_to_id('[EOS]')], dtype=torch.int64)
@@ -44,14 +51,18 @@ class ChatbotDataset(Dataset):
             self.pad_token = torch.tensor([tokenizer.convert_tokens_to_ids('<|pad|>')])
             self.unk_token = torch.tensor([tokenizer.convert_tokens_to_ids('<|unk|>')])
 
+        # Store special tokens as class objects in order to access them freely later
         self.__class__.special_tokens = list({*self.__class__.special_tokens, *[self.sos_token, self.eos_token, self.pad_token, self.unk_token]})
 
     def __len__(self):
         return len(self.dataset.dataset.keys())
 
     def __getitem__(self, index: int):
+        # Extract the context and response using the DataLoader during training and validation
         context = self.dataset.dataset[index]['context']
         response = self.dataset.dataset[index]['response']
+
+        # Tokenize the context and response using the tokenizer
         if self.transfer_learning:
             context_tokens = self.tokenizer.encode(context)
             response_tokens = self.tokenizer.encode(response)
@@ -59,13 +70,27 @@ class ChatbotDataset(Dataset):
             context_tokens = self.tokenizer.encode(context).ids
             response_tokens = self.tokenizer.encode(response).ids
 
-        num_enc_padding_token = self.seq_len - (len(context_tokens) + 2)
-        num_dec_padding_token = self.seq_len - (len(response_tokens) + 2)
+        # If the length of the context or response is greater than the sequence length, truncate the context or response
+        full_context_length = len(context_tokens) + 2
+        full_response_length = len(response_tokens) + 2
+
+        if full_context_length > self.seq_len:
+            context_tokens = context_tokens[:self.seq_len - 2]
+            full_context_length = len(context_tokens) + 2
+
+        if full_response_length > self.seq_len:
+            response_tokens = response_tokens[:self.seq_len - 2]
+            full_response_length = len(response_tokens) + 2
+
+        # Add pad tokens after sos tokens if the context or response is smaller than the sequence length
+        num_enc_padding_token = self.seq_len - full_context_length
+        num_dec_padding_token = self.seq_len - full_response_length
 
         if num_enc_padding_token < 0 or num_dec_padding_token < 0:
-            self.logger.error(f'Sentence is too long')
-            raise ValueError('Sentence is too long')
+            self.logger.error(f'Sentence is too long - Context Token Length: {len(context_tokens)}, Response Token Length: {len(response_tokens)}')
+            raise ValueError(f'Sentence is too long - Context Token Length: {len(context_tokens)}, Response Token Length: {len(response_tokens)}')
 
+        # Create the encoder input, decoder input and the label to input into the transformer model
         encoder_input = torch.cat(
             [
                 self.sos_token,
@@ -92,6 +117,7 @@ class ChatbotDataset(Dataset):
             ]
         )
 
+        # Ensure that the data sizes are correct
         encoder_input_size = encoder_input.size(0)
         decoder_input_size = decoder_input.size(0)
         label_size = label.size(0)
@@ -103,8 +129,7 @@ class ChatbotDataset(Dataset):
         encoder_mask = (encoder_input != self.pad_token).unsqueeze(0).unsqueeze(1).type(torch.bool)
 
         # Decoder mask: [1, seq_len, seq_len]
-        seq_len = self.seq_len
-        subsequent_mask = torch.triu(torch.ones((seq_len, seq_len), dtype=torch.uint8), diagonal=1).to(torch.bool)
+        subsequent_mask = torch.triu(torch.ones((self.seq_len, self.seq_len), dtype=torch.uint8), diagonal=1).to(torch.bool)
         decoder_mask = (decoder_input != self.pad_token).unsqueeze(0).unsqueeze(1) & ~subsequent_mask
 
         return {
@@ -120,46 +145,88 @@ class ChatbotDataset(Dataset):
 
 @typechecked
 def remove_stutter(text: str) -> str:
+    # Remove any existing stutters defined as repeating letters separated by hyphens
     stutter_pattern = re.compile(r'\b(\w)-\1(\w+)\b', re.IGNORECASE)
     corrected_text = stutter_pattern.sub(r'\1\2', text)
     return corrected_text
 
 
-def preprocess_text_data(dataset: list, seq_len: int) -> dict:
+@typechecked
+def remove_most_common_words(sentences: list, top_n: int):
+    stop_words = set(stopwords.words('english'))
+    processed_sentences = []
+    for sentence in sentences:
+        words = sentence.split(' ')
+        filtered_words = [word for word in words if word not in stop_words]
+        processed_sentence = ' '.join(filtered_words)
+        processed_sentences.append(processed_sentence)
+
+    combined_text = ' '.join(processed_sentences)
+
+    # Remove punctuation and convert to lowercase
+    translator = str.maketrans('', '', string.punctuation)
+    normalized_text = combined_text.translate(translator).lower()
+
+    # Tokenize the text
+    words = normalized_text.split(' ')
+
+    # Count the frequency of each word
+    word_counts = Counter(words)
+
+    # Get the most common words
+    most_common_words = word_counts.most_common(top_n)
+
+    print(f'Top {str(top_n) + " words" if top_n > 1 else "word"} being removed from the text data:\n{most_common_words}')
+
+    # Remove the top n common words from the sentences
+    final_sentences = []
+    for preprocessed_sentence in processed_sentences:
+        preprocessed_words = preprocessed_sentence.split(' ')
+        filtered_preprocessed_words = [preprocessed_word for preprocessed_word in preprocessed_words if preprocessed_word not in most_common_words]
+        final_sentence = ' '.join(filtered_preprocessed_words)
+        final_sentences.append(final_sentence)
+
+    return final_sentences
+
+
+def preprocess_text_data(dataset: list, seq_len: int, logger: logging.Logger, top_n: int = 1) -> dict:
+    # The max sentence length should be at most 2 words less than the sequence length to adjust for sos and eos tokens.
     max_sentence_length = seq_len - 2
 
+    # The text might have stutters, weird symbols or characters, or some extra white spaces so that will all be removed.
     normalized_text = []
     for t in dataset:
         sentence = remove_stutter(' '.join(t.replace('\\N', ' ').split())).lower()
-        sentence = re.sub(r'[^A-Za-z\s]', '', sentence)
+        sentence = re.sub(r'[^0-9A-Za-z\s]', '', sentence)
         sentence = sentence.strip()
         sentence = re.sub(r'\s+', ' ', sentence)
         if len(sentence.split(' ')) > 1:
             normalized_text.append(sentence)
 
-    def split(sentence: str):
-        # Split the sentence if it's too long
-        words = sentence.split(' ')
-        sentence_length = len(words)
-        if sentence_length <= max_sentence_length:
-            return [sentence]
-        else:
-            return [' '.join(words[:max_sentence_length])] + split(' '.join(words[max_sentence_length:]))
-
+    # texts that are longer than max_sentence_length will be split into valid sentences
     text = []
     for t in normalized_text:
-        sentences = split(t)
+        sentences = []
+        words = t.split(' ')
+        while len(words) > max_sentence_length:
+            sentences.append(' '.join(words[:max_sentence_length]))
+            words = words[max_sentence_length:]
+
+        if len(words) > 0:
+            sentences.append(' '.join(words))
+
         text.extend(sentences)
 
-    max_length = -1
-    for t in text:
-        n_words = len(t.split(' '))
-        if n_words > max_length:
-            max_length = n_words
+    # Remove the top n most common words from the text data to avoid overfitting
+    text = remove_most_common_words(sentences=text, top_n=top_n)
 
+    # Prepare the text data into a dictionary that can be used to build a torch Dataset object
     text_dict = {}
     max_input_length = -1
     for i, t in enumerate(text[:-1]):
+        if len(t.split(' ')) > max_sentence_length:
+            logger.error(len(t))
+
         n_words = len(t.split(' '))
         if n_words > max_input_length:
             max_input_length = n_words
@@ -171,6 +238,7 @@ def preprocess_text_data(dataset: list, seq_len: int) -> dict:
 
 @typechecked
 def get_or_build_tokenizer(config: dict, dataset: Optional[dict] = None) -> Union[GPT2Tokenizer, Tokenizer]:
+    # If tranfer learning is enabled, the GPT2 tokenizer will be loaded into memory and configured
     if config['transfer_learning']:
         tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
 
@@ -189,6 +257,7 @@ def get_or_build_tokenizer(config: dict, dataset: Optional[dict] = None) -> Unio
         # Resize the model's token embeddings to accommodate the new tokens
         return tokenizer
 
+    # Otherwise, if the tokenizer doesn't exist in storage, it will be trained on the text dataset
     tokenizer_path = Path(config['tokenizer_path'])
     if not tokenizer_path.exists():
         tokenizer = Tokenizer(WordLevel(unk_token='[UNK]'))
@@ -202,6 +271,8 @@ def get_or_build_tokenizer(config: dict, dataset: Optional[dict] = None) -> Unio
         lexicon = [dataset[i]['context'] for i in dataset.keys()] + [dataset[len(dataset) - 1]['response']]
         tokenizer.train_from_iterator(lexicon, trainer=trainer)
         tokenizer.save(str(tokenizer_path))
+
+    # If the tokenizer exists in storage, it will be loaded into memory
     else:
         tokenizer = Tokenizer.from_file(str(tokenizer_path))
 
@@ -221,7 +292,7 @@ def split_dataset(
     val_dataset_size = len(dataset) - train_dataset_size
     train_dataset_raw, val_dataset_raw = random_split(dataset, (train_dataset_size, val_dataset_size))
 
-    # Create the dataset
+    # Create the torch Dataset objects
     train_dataset = ChatbotDataset(dataset=train_dataset_raw, tokenizer=tokenizer, seq_len=config['seq_len'], logger=logger, transfer_learning=config['transfer_learning'])
     val_dataset = ChatbotDataset(dataset=val_dataset_raw, tokenizer=tokenizer, seq_len=config['seq_len'], logger=logger, transfer_learning=config['transfer_learning'])
 
@@ -229,6 +300,7 @@ def split_dataset(
 
 
 def custom_collate_fn(batch: list):
+    # To avoid any incorrect data from loading into the training device, this function will filter out any invalid data
     filtered_batch = []
     for idx, item in enumerate(batch):
         try:
@@ -277,9 +349,12 @@ def custom_collate_fn(batch: list):
 
 @typechecked
 def print_gpu_utilization(logger: logging.Logger, scale: str = 'MB'):
+    # Initialize the NVML library and get the handle to the first GPU device
     pynvml.nvmlInit()
     handle = pynvml.nvmlDeviceGetHandleByIndex(0)
     info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+
+    # Access the used memory by the GPU to provide console output
     if scale == 'MB':
         logger.info(f"GPU memory occupied: {info.used // 1024 ** 2:.2f} MB.")
     else:
@@ -390,20 +465,38 @@ def autoregressive_decode(model: Transformer, input_tokens: torch.Tensor, seq_le
 
 @typechecked
 def train_chatbot(raw_dataset: list, config: dict, train_info: dict, logger: logging.Logger):
+    # Create a Path object from the model path in the config dict to determine if the model has already been trained
     model_path = Path(config['model_path'])
     if not model_path.exists():
+        # Extract the number of epochs from the config dictionary as it will be used multiple times
         num_epochs = config['num_epochs']
-        dataset = preprocess_text_data(dataset=raw_dataset, seq_len=config['seq_len'])
+
+        # Preprocess the text data so that it is clean and prepared for training a chatbot
+        dataset = preprocess_text_data(dataset=raw_dataset, seq_len=config['seq_len'], logger=logger)
+
+        # Store the cleaned text dataset for later analysis
         train_info['dataset'] = dataset
+
+        # Assign the deep learning to a computing device (GPU, TPU, or CPU)
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         logger.info(f'The neural network will be running on {device}')
+
+        # Build a tokenizer using the cleaned text dataset if it doesn't exist
         tokenizer = get_or_build_tokenizer(config=config, dataset=dataset)
+
+        # Split the dataset into training and validation sets and convert them into torch Dataset objects
         train_dataset, val_dataset = split_dataset(dataset=dataset, tokenizer=tokenizer, config=config, logger=logger)
+
+        # Create Dataloader objects for the training and validation sets
         train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=custom_collate_fn, pin_memory=True)
         val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, collate_fn=custom_collate_fn, pin_memory=True)
+
+        # Get parameters for model construction
         vocab_size = len(tokenizer.get_vocab())
         total_batches = len(train_loader)
 
+        # Different models will be built depending on if transfer learning is enabled or not
+        # Different schedulers and optimizers can be used to find how fast a global minimum is found.
         if config['transfer_learning']:
             model = GPT2LMHeadModel.from_pretrained('gpt2')
             model.to(device)
@@ -437,15 +530,23 @@ def train_chatbot(raw_dataset: list, config: dict, train_info: dict, logger: log
                 mode='triangular2'
             )
 
-        val_loss = 0.0
+        # Instantiate the gradient scaler to avoid vanishing gradients
         scaler = GradScaler()
+
+        # Initialize an interator for the epochs to generate a cool loop monitor
         epoch_iterator = tqdm(range(num_epochs), desc=f'Epoch counter')
+
+        # Start training
         for epoch in epoch_iterator:
+            # Keep track of progress and time
             epoch_time = time.time()
-            model.train()
             train_loss = 0
             last_printed_progress = 0
+
+            # Set model to train mode and start training loop
+            model.train()
             for idx, batch in enumerate(train_loader):
+                # Keep track of how long it takes to go through one batch and which batch is currently in memory
                 train_batch_start_time = time.time()
                 progress = (idx + 1) / total_batches * 100
 
@@ -453,14 +554,19 @@ def train_chatbot(raw_dataset: list, config: dict, train_info: dict, logger: log
                     last_printed_progress = int(progress) // 10
                     logger.info(f'Epoch {epoch + 1}/{config["num_epochs"]} Training Loop is {progress:.2f}% completed')
 
+                # Extract all the tensors from the DataLoader object and send them to the training device
                 encoder_input = batch['encoder_input'].to(device, non_blocking=True)
                 decoder_input = batch['decoder_input'].to(device, non_blocking=True)
                 encoder_mask = batch['encoder_mask'].to(device, non_blocking=True)
                 decoder_mask = batch['decoder_mask'].to(device, non_blocking=True)
                 labels = batch['label'].to(device, non_blocking=True)
+
+                # Zero out the gradients from the previous batch
                 optimizer.zero_grad()
 
+                # Implement mixed precision by using autocast
                 with autocast():
+                    # If transfer learning is enabled, the model expects concatenated inputs and masks
                     if config['transfer_learning']:
                         # Concatenate encoder and decoder inputs
                         combined_input = torch.cat((encoder_input, decoder_input), dim=1)  # (batch_size, seq_len * 2)
@@ -481,33 +587,62 @@ def train_chatbot(raw_dataset: list, config: dict, train_info: dict, logger: log
 
                         # Since target labels correspond only to the decoder part, slice the output logits accordingly
                         output = decoder_output_logits[:, encoder_input.size(1):, :]
+
+                        # Calculate loss
                         loss = criterion(output.reshape(-1, vocab_size), labels.view(-1))
+
+                    # Otherwise, the transformer model built in generic_transformer.py will be used
                     else:
+                        # Generate output using the transformer model
                         output = model.forward(encoder_input, decoder_input, encoder_mask, decoder_mask)
+
+                        # Calculate loss
                         loss = criterion(output.view(-1, vocab_size), labels.view(-1))
 
+                # If nans are encountered, skip that batch to avoid runtime exceptions
                 if torch.any(torch.isnan(loss)) or torch.any(torch.isinf(loss)):
                     logger.info(f"NaN or Inf detected in loss at batch {idx + 1} - {batch['context']}, {batch['response']}")
                     continue
 
+                # Commence backpropagation
                 scaler.scale(loss).backward()
+
+                # Clip gradients to avoid exploding gradients
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+
+                # Update optimizer and scaler
                 scaler.step(optimizer)
                 scaler.update()
+
+                # Update training loss
                 train_loss += loss.item()
+
+                # Update scheduler
                 scheduler.step()
 
+                # Keep track of how long it takes to go through one batch
                 train_batch_end_time = time.time()
                 if train_batch_end_time - train_batch_start_time > 3:
                     logger.info(f'batch {idx + 1} took {train_batch_end_time - train_batch_start_time} seconds')
 
+
+            # Calculate average training loss
             train_loss /= len(train_loader)
+
+            # Store training metrics in the train_info dictionary
             train_info['train_losses'].append(train_loss)
             train_info['learning_rates'].append(optimizer.param_groups[0]["lr"])
 
+            # Set the model to evaluation mode
             model.eval()
+
+            # Keep track of progress
+            val_loss = 0
+
+            # Disable gradient calculation during validation
             with torch.no_grad():
                 for idx, batch in enumerate(val_loader):
+                    # Keep track of how long it takes to go through one batch and which batch is currently in memory
                     val_batch_start_time = time.time()
                     progress = (idx + 1) / total_batches * 100
 
@@ -515,11 +650,13 @@ def train_chatbot(raw_dataset: list, config: dict, train_info: dict, logger: log
                         last_printed_progress = int(progress) // 10
                         logger.info(f'Epoch {epoch + 1}/{config["num_epochs"]} Training Loop is {progress:.2f}% completed')
 
+                    # Extract all the tensors from the DataLoader object and send them to the training device
                     encoder_input = batch['encoder_input'].to(device, non_blocking=True)
                     encoder_mask = batch['encoder_mask'].to(device, non_blocking=True)
                     decoder_input = batch['decoder_input'].to(device, non_blocking=True)
                     labels = batch['label'].to(device, non_blocking=True)
 
+                    # If transfer learning is enabled, the model expects concatenated inputs and masks
                     if config['transfer_learning']:
                         # Concatenate encoder and decoder inputs
                         combined_input = torch.cat((encoder_input, decoder_input), dim=1)  # (batch_size, seq_len * 2)
@@ -541,36 +678,48 @@ def train_chatbot(raw_dataset: list, config: dict, train_info: dict, logger: log
                         # Since target labels correspond only to the decoder part, slice the output logits accordingly
                         output = decoder_output_logits[:, encoder_input.size(1):, :]
                         loss = criterion(output.reshape(-1, vocab_size), labels.view(-1))
+
+                    # Otherwise, the transformer model built in generic_transformer.py will be used
                     else:
                         # Inference validation
                         output_tokens = autoregressive_decode(model, encoder_input, config['seq_len'], tokenizer, device)
                         output = model.forward(encoder_input, output_tokens, encoder_mask, None)
                         loss = criterion(output.view(-1, vocab_size), batch['label'].view(-1).to(device))
 
+                    # If nans are encountered, skip that batch to avoid runtime exceptions
                     if torch.isnan(loss) or torch.isinf(loss):
                         logger.info(f"NaN or Inf detected in loss at batch {idx + 1} - {batch['context']}, {batch['response']}")
                         continue
 
+                    # Update validation loss
                     val_loss += loss.item()
+
+                    # Keep track of how long it takes to go through one batch
                     val_batch_end_time = time.time()
                     if val_batch_end_time - val_batch_start_time > 3:
                         logger.info(f'batch {idx + 1} took {val_batch_end_time - val_batch_start_time} seconds')
 
+            # Calculate average validation loss
             val_loss /= len(val_loader)
+
+            # Store validation metrics in the train_info dictionary
             train_info['val_losses'].append(val_loss)
             train_info['epochs'].append(epoch + 1)
 
+            # Calculate the current patience being experienced by the gradient
             if val_loss < train_info['best_val_loss']:
                 train_info['best_val_loss'] = val_loss
                 train_info['patience_counter'] = 0
             else:
                 train_info['patience_counter'] += 1
 
+            # Performance console output
             monitoring_string = f'Epoch {epoch + 1}/{config["num_epochs"]} took {time.time() - epoch_time:.2f} seconds, Loss: {train_loss},  Validation Loss: {val_loss}, Learning rate: {optimizer.param_groups[0]["lr"]}'
             logger.info(monitoring_string)
             epoch_iterator.set_postfix({f'Epoch {epoch + 1}/{config["num_epochs"]}': monitoring_string})
             print_gpu_utilization(logger=logger)
 
+            # Determine if early stopping is necessary
             if train_info['patience_counter'] >= config['patience']:
                 logger.info("Early stopping triggered.")
                 break

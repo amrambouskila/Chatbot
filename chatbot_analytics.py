@@ -12,10 +12,11 @@ sns.set()
 
 @typechecked
 def word_analytics(sentences: list, width: int = 800, height: int = 400, background_color: str = 'white'):
+    # Load all the stop words from the ntlk corpus and remove them from the dataset temporarily for analysis
     stop_words = set(stopwords.words('english'))
     text = [word for sentence in sentences for word in sentence.split(' ') if word not in stop_words]
 
-    # Wordcloud
+    # Build a wordcloud to visualize the most common words
     tokens = nltk.word_tokenize(' '.join(text))
     processed_text = ' '.join(tokens)
     wordcloud = WordCloud(width=width, height=height, background_color=background_color).generate(processed_text)
@@ -24,7 +25,7 @@ def word_analytics(sentences: list, width: int = 800, height: int = 400, backgro
     plt.axis('off')
     plt.show()
 
-    # Word Distribution
+    # Build a word distribution in order to determine a good sequence length
     sequence_lengths = [len(sequence) for sequence in text]
     fig, ax = plt.subplots()
     ax.hist(sequence_lengths, bins=50)
@@ -35,16 +36,19 @@ def word_analytics(sentences: list, width: int = 800, height: int = 400, backgro
 
 @typechecked
 def plot_losses(train_info: dict):
+    # Extract information from the train info dictionary populated during training
     train_losses = train_info['train_losses']
     learning_rates = train_info['learning_rates']
     epochs = train_info['epochs']
 
+    # Create one plot with two axes to plot the training and validation losses on the same plot as the learning rate
     fig, ax1 = plt.subplots()
 
     ax1.set_xlabel('Epochs')
     ax1.set_ylabel('Loss', color='tab:blue')
     ax1.plot(epochs, train_losses, label='Training Loss', color='tab:blue')
 
+    # With large datasets, inference validation is extremely tedious, so sometimes validation is skipped.
     if len(train_info['val_losses']) > 0:
         ax1.plot(epochs, train_info['val_losses'], label='Validation Loss', color='tab:orange')
         ax1.legend(loc='best')

@@ -264,11 +264,15 @@ class Transformer(nn.Module):
 
 @typechecked
 def build_transformer(vocab_size: int, seq_len: int, d_model: int, N: int, h: int, dropout: float, d_ff: int) -> Transformer:
+    # Build the first layer of the encoder and decoder blocks, which is the input embedding
     src_embed = InputEmbeddings(d_model, vocab_size)
     tgt_embed = InputEmbeddings(d_model, vocab_size)
+
+    # Add the second layer of positional encoding to add spatial relationships between tokens
     src_pos = PositionalEncoding(d_model, seq_len, dropout)
     tgt_pos = PositionalEncoding(d_model, seq_len, dropout)
 
+    # Build the encoder blocks using multi head self attention and feed forward blocks
     encoder_blocks = []
     for _ in range(N):
         encoder_self_attention_block = MultiHeadAttentionBlock(d_model, h, dropout)
@@ -276,15 +280,16 @@ def build_transformer(vocab_size: int, seq_len: int, d_model: int, N: int, h: in
         encoder_block = EncoderBlock(encoder_self_attention_block, feed_forward_block, dropout)
         encoder_blocks.append(encoder_block)
 
+    # Build the decoder blocks using multi head self attention, multi head cross attention, and feed forward blocks
     decoder_blocks = []
     for _ in range(N):
         decoder_self_attention_block = MultiHeadAttentionBlock(d_model, h, dropout)
         decoder_cross_attention_block = MultiHeadAttentionBlock(d_model, h, dropout)
         feed_forward_block = FeedForwardBlock(d_model, d_ff, dropout)
-        decoder_block = DecoderBlock(decoder_self_attention_block, decoder_cross_attention_block, feed_forward_block,
-                                     dropout)
+        decoder_block = DecoderBlock(decoder_self_attention_block, decoder_cross_attention_block, feed_forward_block, dropout)
         decoder_blocks.append(decoder_block)
 
+    # Build the transformer model using the encoder, decoder, and projection layer
     encoder = Encoder(nn.ModuleList(encoder_blocks))
     decoder = Decoder(nn.ModuleList(decoder_blocks))
     projection_layer = ProjectionLayer(d_model, vocab_size)

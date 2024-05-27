@@ -1,3 +1,4 @@
+import re
 import nltk
 import logging
 import requests
@@ -12,6 +13,7 @@ def get_subcategory_link(url: str, subcategory: str, logger: logging.Logger):
     # Send a GET request to the genre page
     response = requests.get(url)
 
+    # Check if the request was successful
     if response.status_code == 200:
         # Parse the HTML content of the genre page
         soup = BeautifulSoup(response.content, 'html.parser')
@@ -19,6 +21,7 @@ def get_subcategory_link(url: str, subcategory: str, logger: logging.Logger):
         # Find the subcategory link that matches the query
         subcategory_link_tag = soup.find('a', href=True, string=lambda text: text and subcategory.lower() in text.lower())
 
+        # If the subcategory link was found, return the corresponding url, else log a list of available subcategories
         if subcategory_link_tag:
             subcategory_url = 'https://www.gutenberg.org' + subcategory_link_tag['href']
             return subcategory_url
@@ -37,19 +40,29 @@ def get_subcategory_link(url: str, subcategory: str, logger: logging.Logger):
 
 @typechecked
 def get_book_links(subcategory_url: str, logger: logging.Logger):
+    # When sending a GET request to the subcategory_url, there will be 25 books per page starting with an index of 1
     start_index = 1
+
+    # This dictionary will keep track of all the download links and which books they are corresponding to
     txt_file_links = {}
 
+    # I want to keep going to the next page of 25 books until there is no more books
     while True:
+        # If this is the first page, the url will be the subcategory_url.
         if start_index == 1:
             paginated_url = f"{subcategory_url}"
+
+        # Otherwise, the start_index query string must be included
         else:
             paginated_url = f"{subcategory_url}?start_index={start_index}"
 
+        # Send a GET request to the paginated url
         response = requests.get(paginated_url)
 
         if response.status_code == 200:
             logger.info(f'Accessed {paginated_url}')
+
+            # parse the html of the webpage in order to find the book links
             soup = BeautifulSoup(response.content, 'html.parser')
             book_links = soup.find_all('li', class_='booklink')
 
@@ -57,6 +70,7 @@ def get_book_links(subcategory_url: str, logger: logging.Logger):
             if not book_links:
                 break
 
+            # Loop through the book links and extract the title and author of the book, as well as the download link
             for i, book in enumerate(book_links):
                 title_tag = book.find('span', class_='title')
                 subtitle_tag = book.find('span', class_='subtitle')
@@ -92,6 +106,7 @@ def get_book_links(subcategory_url: str, logger: logging.Logger):
 
 @typechecked
 def get_sentences(txt_links: dict, logger: logging.Logger, intro_pct: float = 0.02):
+    # A list of strings will be returned for each book found in the subcategory library in project gutenberg
     all_sentences = []
 
     for link in txt_links.values():
@@ -110,7 +125,11 @@ def get_sentences(txt_links: dict, logger: logging.Logger, intro_pct: float = 0.
             remaining_words = words[int(intro_pct * len(words)):-int(intro_pct * len(words))]
 
             # Join the remaining words back into a string
-            remaining_text = ' '.join(remaining_words)
+            text = ' '.join(remaining_words)
+
+            # Remove project gutenberg out of the text since it occurs so often
+            remaining_text = re.sub('project gutenberg', '', text, flags=re.IGNORECASE)
+            remaining_text = re.sub('gutenberg', '', text, flags=re.IGNORECASE)
 
             # Split the remaining text into sentences
             sentences = nltk.sent_tokenize(remaining_text)
@@ -125,9 +144,10 @@ def get_sentences(txt_links: dict, logger: logging.Logger, intro_pct: float = 0.
 
 @typechecked
 def get_text_data(subcategory: str, logger: logging.Logger):
+    # Start off with project gutenberg's bookshelf
     url = 'https://www.gutenberg.org/ebooks/bookshelf/'
 
-    # Get the link to the subcategory page
+    # Get the link to the desired subcategory page
     subcategory_url = get_subcategory_link(url=url, subcategory=subcategory, logger=logger)
 
     if subcategory_url:
