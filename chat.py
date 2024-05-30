@@ -191,7 +191,7 @@ if __name__ == '__main__':
         'h': 8,
         'N': 6,
         'd_ff': 2048,
-        'num_epochs': 1,
+        'num_epochs': 2,
         'learning_rate': 1e-5,
         'patience': 5,
         'transfer_learning': False,
