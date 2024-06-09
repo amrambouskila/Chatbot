@@ -4,7 +4,7 @@ import matplotlib
 import seaborn as sns
 import torch.nn as nn
 from typeguard import typechecked
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 matplotlib.use('Qt5Agg', force=True)
 sns.set()
@@ -227,7 +227,7 @@ class Transformer(nn.Module):
             tgt_embed: InputEmbeddings,
             src_pos: PositionalEncoding,
             tgt_pos: PositionalEncoding,
-            projection_layer: ProjectionLayer
+            projection_layer: Union[ProjectionLayer, nn.Linear]
     ):
 
         super().__init__()
